@@ -209,17 +209,42 @@ class TestHyperRAMDDR(unittest.TestCase):
             self.check_write_read(delay=delay, bursts=[(0x40, 8)])
 
     def test_split_bursts(self):
-        # max_words=16: a 64 beats AXI burst is split in 4 HyperRAM bursts.
-        dut   = DUT(max_words=16)
+        # max_words=16: a 64 beats AXI burst is split in 4 HyperRAM commands, merged back in a single
+        # HyperRAM access with continuation.
+        for with_continuation, accesses in [(False, 8), (True, 2)]:
+            with self.subTest(with_continuation=with_continuation):
+                dut   = DUT(max_words=16, with_continuation=with_continuation)
+                model = HyperRAMDDRModel(dut.phy_if)
+                data  = list(range(1, 65))
+                res   = {}
+                def gen():
+                    yield from axi_write(dut.core.bus, 0x400, data)
+                    res["rd"], _ = yield from axi_read(dut.core.bus, 0x400, 64)
+                self.run_dut(dut, model, gen)
+                self.assertEqual(res["rd"], data)
+                self.assertEqual(model.accesses, accesses)
+
+    def test_continuation_sequential_bursts(self):
+        # Sequential AXI bursts issued back to back are merged; non-sequential ones are not.
+        dut   = DUT()
         model = HyperRAMDDRModel(dut.phy_if)
-        data  = list(range(1, 65))
+        random.seed(1)
+        data  = [random.getrandbits(32) for _ in range(64)]
         res   = {}
-        def gen():
-            yield from axi_write(dut.core.bus, 0x400, data)
-            res["rd"], _ = yield from axi_read(dut.core.bus, 0x400, 64)
-        self.run_dut(dut, model, gen)
+        def writer():
+            for i in range(4):
+                yield from axi_write(dut.core.bus, 0x1000 + 64*i, data[16*i:16*(i+1)])
+            yield from axi_write(dut.core.bus, 0x8000, data[:16])
+            rd = []
+            for i in range(4):
+                d, _ = yield from axi_read(dut.core.bus, 0x1000 + 64*i, 16)
+                rd += d
+            res["rd"] = rd
+            d, _ = yield from axi_read(dut.core.bus, 0x8000, 16)
+            res["rd2"] = d
+        self.run_dut(dut, model, writer)
         self.assertEqual(res["rd"], data)
-        self.assertEqual(model.accesses, 8)
+        self.assertEqual(res["rd2"], data[:16])
 
     def test_strobes(self):
         dut   = DUT()

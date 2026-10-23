@@ -27,6 +27,8 @@ Architecture:
   PLL dynamic phase shift).
 """
 
+import math
+
 from migen import *
 from migen.genlib.cdc import MultiReg
 
@@ -180,10 +182,12 @@ class HyperRAMDDRCore(LiteXModule):
     - max_words    : Max words per HyperRAM burst (default: from tCSM, at most 256).
     - size         : HyperRAM size in bytes (AXI addresses are masked to it, ex to ignore the SoC
                      region base).
+    - with_continuation : Continue the HyperRAM burst with the next AXI command when sequential and
+                     in the same direction (CS# kept low up to tCSM, saving CA/latency/tRWR).
     - with_reset   : Pulse RST# and wait tVCS at startup.
     """
     def __init__(self, phy_if, clk_freq, latency=7, axi_id_width=4, fifo_depth=512, max_words=None,
-        size=None, with_reset=True, with_csr=True):
+        size=None, with_continuation=True, with_reset=True, with_csr=True):
         dw         = phy_if.dq_width
         word_width = 2*dw
         word_bytes = word_width//8
@@ -197,9 +201,11 @@ class HyperRAMDDRCore(LiteXModule):
             raise ValueError("HyperRAM clock too low for tCSM.")
         if fifo_depth < max_words:
             raise ValueError("HyperRAM DDR fifo_depth must be >= max_words.")
+        # Max words per CS# low period (CA + latency + data below tCSM).
+        cs_words_max = max(max_words, int(HYPERRAM_DDR_TCSM*clk_freq) - 3 - 2*latency - 8)
         # CS# high time between accesses: tRWR, and at least the read capture window close delay
         # (+2: CS# hold cycles added by the PHY after the last CK cycle).
-        trwr_cycles = max(4, int(HYPERRAM_DDR_TRWR*clk_freq) + 1) + 2
+        trwr_cycles = max(4, math.ceil(HYPERRAM_DDR_TRWR*clk_freq)) + 2
 
         self.bus = bus = axi.AXIInterface(
             data_width    = word_width,
@@ -253,7 +259,7 @@ class HyperRAMDDRCore(LiteXModule):
 
         # B responses.
         # ------------
-        self.b_fifo = b_fifo = stream.SyncFIFO([("id", axi_id_width)], 4)
+        self.b_fifo = b_fifo = stream.SyncFIFO([("id", axi_id_width)], 8)
         self.comb += [
             bus.b.valid.eq(b_fifo.source.valid),
             bus.b.id.eq(b_fifo.source.id),
@@ -283,10 +289,11 @@ class HyperRAMDDRCore(LiteXModule):
 
         # Words routed to the register interface or R FIFO; timeouts inject error beats.
         rd_reg        = Signal()          # Current read is a register read.
-        rd_expected   = Signal(10)        # Words still expected for the current read.
+        rd_expected   = Signal(11)        # Words still expected for the current read.
+        rd_add        = Signal(9)         # Words added to the current read (continuation).
         rd_inject     = Signal()
         self.comb += [
-            r_fifo.sink.valid.eq((cap_source.valid & ~rd_reg & (rd_expected != 0)) | rd_inject),
+            r_fifo.sink.valid.eq(~rd_reg & (((cap_source.valid & (rd_expected != 0)) | rd_inject))),
             r_fifo.sink.data.eq(cap_source.data),
             r_fifo.sink.resp.eq(Mux(rd_inject, axi.RESP_SLVERR, axi.RESP_OKAY)),
             cap_source.ready.eq(1),
@@ -332,6 +339,28 @@ class HyperRAMDDRCore(LiteXModule):
         sel_w = Signal()
         self.comb += sel_w.eq(Mux(w_ok & r_ok, ~last_write, w_ok))
 
+        # Burst continuation: next command sequential, same direction, fits in tCSM.
+        cs_words = Signal(max=cs_words_max + 257)
+        next_w   = Signal()
+        next_r   = Signal()
+        if with_continuation:
+            self.comb += [
+                next_w.eq(
+                    aw_split.source.valid &
+                    (aw_split.source.addr == (cmd_addr + cmd_len*word_bytes)) &
+                    (w_level >= (aw_split.source.len + 1)) &   # +1: current word still in FIFO.
+                    (b_fifo.level < (b_fifo.depth - 1)) &
+                    ((cs_words + aw_split.source.len) <= cs_words_max)
+                ),
+                next_r.eq(
+                    ar_split.source.valid &
+                    (ar_split.source.addr == (cmd_addr + cmd_len*word_bytes)) &
+                    ((r_reserved + ar_split.source.len) <= fifo_depth) &
+                    rd_cmd.sink.ready &
+                    ((cs_words + ar_split.source.len) <= cs_words_max)
+                ),
+            ]
+
         # CA generation.
         # --------------
         ca      = Signal(48)
@@ -373,6 +402,7 @@ class HyperRAMDDRCore(LiteXModule):
                     NextValue(cmd_len, 1),
                     NextState("CA0"),
                 ).Elif(w_ok | r_ok,
+                    NextValue(cs_words, Mux(sel_w, aw_split.source.len, ar_split.source.len)),
                     NextValue(cmd_reg,    0),
                     NextValue(cmd_we,     sel_w),
                     NextValue(last_write, sel_w),
@@ -422,7 +452,7 @@ class HyperRAMDDRCore(LiteXModule):
                     NextState("WRITE")
                 ).Else(
                     NextValue(rd_reg, cmd_reg),
-                    NextValue(rd_expected, cmd_len),
+                    rd_add.eq(cmd_len),
                     NextState("READ")
                 )
             )
@@ -453,7 +483,16 @@ class HyperRAMDDRCore(LiteXModule):
                     b_fifo.sink.id.eq(cmd_id),
                 ),
                 NextValue(count, 0),
-                NextState("END"),
+                If(next_w,
+                    aw_split.source.ready.eq(1),
+                    NextValue(cmd_addr, aw_split.source.addr),
+                    NextValue(cmd_len,  aw_split.source.len),
+                    NextValue(cmd_id,   aw_split.source.id),
+                    NextValue(cmd_last, aw_split.source.last),
+                    NextValue(cs_words, cs_words + aw_split.source.len),
+                ).Else(
+                    NextState("END"),
+                )
             )
         )
         fsm.act("READ",
@@ -463,7 +502,20 @@ class HyperRAMDDRCore(LiteXModule):
             NextValue(count, count + 1),
             If(count == (cmd_len - 1),
                 NextValue(count, 0),
-                NextState("READ-WAIT"),
+                If(next_r & ~cmd_reg,
+                    ar_split.source.ready.eq(1),
+                    rd_cmd.sink.valid.eq(1),
+                    rd_cmd.sink.len.eq(ar_split.source.len),
+                    rd_cmd.sink.id.eq(ar_split.source.id),
+                    rd_cmd.sink.last.eq(ar_split.source.last),
+                    r_reserve.eq(ar_split.source.len),
+                    rd_add.eq(ar_split.source.len),
+                    NextValue(cmd_addr, ar_split.source.addr),
+                    NextValue(cmd_len,  ar_split.source.len),
+                    NextValue(cs_words, cs_words + ar_split.source.len),
+                ).Else(
+                    NextState("READ-WAIT"),
+                )
             )
         )
         # Wait for the read words to cross the capture path (CS# high, no CK).
@@ -486,7 +538,7 @@ class HyperRAMDDRCore(LiteXModule):
                 NextState("END"),
             ).Elif(rd_reg,
                 self.reg_done.eq(1),
-                NextValue(rd_expected, 0),
+                rd_inject.eq(1), # Consumes the missing register word (not sent to the R FIFO).
             ).Else(
                 rd_inject.eq(~cap_source.valid),
             )
@@ -500,9 +552,11 @@ class HyperRAMDDRCore(LiteXModule):
         )
 
         # Read words accounting.
+        rd_dec = Signal()
+        self.comb += rd_dec.eq((cap_source.valid | rd_inject) & (rd_expected != 0))
         self.sync += [
-            If((cap_source.valid | rd_inject) & (rd_expected != 0),
-                rd_expected.eq(rd_expected - 1),
+            rd_expected.eq(rd_expected - rd_dec + rd_add),
+            If(rd_dec,
                 If(rd_reg & cap_source.valid,
                     # Register data: MSB on first edge, LSB on second edge (DQ[7:0]).
                     self.reg_rdata.eq(Cat(cap_source.data[0:8], cap_source.data[dw:dw+8])),
